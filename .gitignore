@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+data/raw/
+data/*.csv
+output/figures/*
+output/results.csv
+*.pkl
+*.h5
+
+# Jupyter
+.ipynb_checkpoints/
