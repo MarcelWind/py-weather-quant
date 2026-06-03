@@ -23,7 +23,8 @@ import seaborn as sns
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
 COLORS = {"B0 Raw Ensemble": "#4C72B0", "B2 Simple Gaussian": "#DD8452",
           "B3 Hybrid Bates-Granger": "#55A868"}
-CITY_LABELS = {"nyc": "New York", "london": "London", "tokyo": "Tokyo"}
+CITY_LABELS = {"nyc": "New York", "london": "London", "tokyo": "Tokyo",
+                "chicago": "Chicago", "mexico-city": "Mexico City"}
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = _PROJECT_ROOT / "output" / "figures"
@@ -284,4 +285,217 @@ def plot_per_city_metrics(metrics_df: pd.DataFrame) -> plt.Figure:
     fig.suptitle("Per-City Model Performance", fontsize=13, fontweight="bold")
     fig.tight_layout()
     _save(fig, "per_city_metrics")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Bracket Probability Bar Chart — model vs market
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def plot_bracket_probabilities(
+    per_bracket_df: pd.DataFrame,
+    city: str,
+    target_date: str,
+    model_name: str = "",
+) -> plt.Figure:
+    """Grouped bar chart: model probability vs market price per bracket.
+
+    Saves as ``bracket_probs_{city}_{date}.png``.
+    """
+    sub = per_bracket_df[
+        (per_bracket_df["target_date"] == target_date)
+    ].sort_values("low")
+    if sub.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, f"No data for {city} on {target_date}",
+                ha="center", va="center", transform=ax.transAxes)
+        _save(fig, f"bracket_probs_{city}_{target_date}")
+        return fig
+
+    labels = sub["bracket_label"].tolist()
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x - width / 2, sub["p_model"].values, width,
+           label=f"Model ({model_name})" if model_name else "Model",
+           color="#4C72B0", alpha=0.85, edgecolor="white")
+    ax.bar(x + width / 2, sub["p_market"].values, width,
+           label="Polymarket", color="#DD8452", alpha=0.85, edgecolor="white")
+
+    # Mark outcome bracket
+    outcome_mask = sub["outcome"].values == 1.0
+    if outcome_mask.any():
+        for i, ok in enumerate(outcome_mask):
+            if ok:
+                ax.annotate("◀ Outcome", (i, 1.02), ha="center", fontsize=8,
+                            color="green", fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Probability / Price")
+    ax.set_title(f"{city.title()} — {target_date}: Model vs Market Bracket Probabilities",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.set_ylim(0, 1.1)
+    fig.tight_layout()
+    _save(fig, f"bracket_probs_{city}_{target_date}")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. Model vs Market Scatter Plot
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def plot_model_vs_market_scatter(
+    per_bracket_df: pd.DataFrame,
+    city: str,
+) -> plt.Figure:
+    """Scatter of model probability vs market price, colored by outcome.
+
+    Saves as ``model_vs_market_scatter_{city}.png``.
+    """
+    df = per_bracket_df.dropna(subset=["p_model", "p_market", "outcome"]).copy()
+    if df.empty:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.text(0.5, 0.5, "No valid data", ha="center", va="center",
+                transform=ax.transAxes)
+        _save(fig, f"model_vs_market_scatter_{city}")
+        return fig
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    colors = df["outcome"].map({0.0: "#e74c3c", 1.0: "#2ecc71"})
+    ax.scatter(df["p_market"], df["p_model"], c=colors, alpha=0.6,
+               edgecolors="gray", linewidth=0.3, s=30)
+    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5, label="Perfect agreement")
+
+    ax.set_xlabel("Market price (Polymarket)")
+    ax.set_ylabel("Model probability")
+    ax.set_title(f"{city.title()} — Model vs Market: Bracket Probability Scatter",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_aspect("equal")
+    ax.legend(fontsize=9)
+
+    # Add correlation text
+    corr = df["p_model"].corr(df["p_market"])
+    ax.text(0.98, 0.02, f"r = {corr:.3f}", transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=10,
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    fig.tight_layout()
+    _save(fig, f"model_vs_market_scatter_{city}")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. Brier Score Comparison — model vs market across models
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def plot_brier_comparison(
+    comparison_results: list[dict],
+) -> plt.Figure:
+    """Grouped bar chart: Brier score (model) vs Brier score (market) per model.
+
+    Saves as ``brier_comparison.png``.
+    """
+    models = []
+    model_briers = []
+    market_briers = []
+    for res in comparison_results:
+        if res["n"] >= 5 and np.isfinite(res.get("brier_model", float("nan"))):
+            models.append(res["model"])
+            model_briers.append(res["brier_model"])
+            market_briers.append(res["brier_market"])
+
+    if not models:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
+                transform=ax.transAxes)
+        _save(fig, "brier_comparison")
+        return fig
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    x = np.arange(len(models))
+    width = 0.35
+
+    bars1 = ax.bar(x - width / 2, model_briers, width, label="Model Brier",
+                   color="#4C72B0", alpha=0.85, edgecolor="white")
+    bars2 = ax.bar(x + width / 2, market_briers, width, label="Market Brier",
+                   color="#DD8452", alpha=0.85, edgecolor="white")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, fontsize=9)
+    ax.set_ylabel("Brier Score (lower is better)")
+    ax.set_title("Model vs Market: Brier Score Comparison", fontsize=12,
+                 fontweight="bold")
+    ax.legend(fontsize=9)
+
+    # Add value labels
+    for bar in bars1:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{bar.get_height():.4f}", ha="center", va="bottom", fontsize=7)
+    for bar in bars2:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{bar.get_height():.4f}", ha="center", va="bottom", fontsize=7)
+
+    fig.tight_layout()
+    _save(fig, "brier_comparison")
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. Lead-time Evolution of Bracket Probability Error
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def plot_lead_time_bracket_evolution(
+    per_bracket_df: pd.DataFrame,
+    lead_hours: np.ndarray,
+    city: str,
+) -> plt.Figure:
+    """Line plot: model-market probability gap vs hours until close.
+
+    Saves as ``lead_time_bracket_evolution_{city}.png``.
+    """
+    df = per_bracket_df.dropna(subset=["p_model", "p_market"]).copy()
+    if df.empty or len(lead_hours) == 0:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No data for lead-time evolution",
+                ha="center", va="center", transform=ax.transAxes)
+        _save(fig, f"lead_time_bracket_evolution_{city}")
+        return fig
+
+    # We don't have per-observation lead times in the bracket comparison,
+    # so we aggregate by bracket and show mean abs error per bracket
+    df["abs_gap"] = np.abs(df["p_model"] - df["p_market"])
+    bracket_gaps = df.groupby("bracket_label")["abs_gap"].agg(["mean", "std", "count"])
+    bracket_gaps = bracket_gaps.sort_values("mean", ascending=False)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = bracket_gaps.index.tolist()
+    x = np.arange(len(labels))
+    means = bracket_gaps["mean"].values
+    stds = bracket_gaps["std"].values
+
+    colors = plt.cm.RdYlGn_r(1.0 - means / (means.max() if means.max() > 0 else 1))
+    ax.bar(x, means, yerr=stds, color=colors, edgecolor="white",
+           capsize=4, alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Mean |Model − Market|")
+    ax.set_title(f"{city.title()} — Model-Market Disagreement by Bracket",
+                 fontsize=12, fontweight="bold")
+
+    # Add count labels
+    for i, (_, row) in enumerate(bracket_gaps.iterrows()):
+        ax.text(i, row["mean"] + (stds[i] if not np.isnan(stds[i]) else 0) + 0.01,
+                f"n={int(row['count'])}", ha="center", fontsize=7)
+
+    fig.tight_layout()
+    _save(fig, f"lead_time_bracket_evolution_{city}")
     return fig

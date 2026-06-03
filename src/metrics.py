@@ -155,6 +155,143 @@ def prediction_entropy(sigma: np.ndarray) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Bracket calibration — reliability of bracket-level probabilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def bracket_calibration(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    y: np.ndarray,
+    n_bins: int = 10,
+    n_thresholds: int = 10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calibration curve for bracket (threshold exceedance) probabilities.
+
+    Uses n_thresholds equally-spaced percentiles of the observed y as binary
+    events, computes P(T > threshold | μ, σ) for each, pools across all
+    thresholds, then bins the predicted probabilities into n_bins and computes
+    the observed frequency per bin.
+
+    Returns
+    -------
+    bin_centers : ndarray
+    observed_freq : ndarray
+    counts : ndarray
+    """
+    mask = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(y)
+    mu_v = mu[mask]
+    sigma_v = sigma[mask]
+    y_v = y[mask]
+    n = len(mu_v)
+    if n < 3:
+        return np.array([]), np.array([]), np.array([])
+
+    thresholds = np.percentile(y_v, np.linspace(5, 95, n_thresholds))
+    all_pred: list[float] = []
+    all_outcome: list[float] = []
+
+    for thresh in thresholds:
+        p_above = 1.0 - norm.cdf(
+            (thresh - mu_v) / np.maximum(sigma_v, math.sqrt(SIGMA_MIN_SQ))
+        )
+        outcome = (y_v >= thresh).astype(float)
+        all_pred.extend(p_above.tolist())
+        all_outcome.extend(outcome.tolist())
+
+    return calibration_curve(
+        np.array(all_pred), np.array(all_outcome), n_bins=n_bins
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. evaluate_model — unified cell-level metric computation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def evaluate_model(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    y: np.ndarray,
+    model_name: str = "",
+) -> dict:
+    """Compute all evaluation metrics for a single (model, cell) result.
+
+    Parameters
+    ----------
+    mu : ndarray — predicted means
+    sigma : ndarray — predicted standard deviations
+    y : ndarray — observed temperatures
+    model_name : str — model identifier for the output dict
+
+    Returns
+    -------
+    dict with keys:
+        model, n, crps, brier, log_loss, sharpness, entropy,
+        reliability_gap, calibration_x, calibration_y
+    """
+    mask = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(y)
+    mu_v = mu[mask]
+    sigma_v = sigma[mask]
+    y_v = y[mask]
+    n = len(mu_v)
+
+    if n < 3:
+        return {
+            "model": model_name, "n": n,
+            "crps": float("nan"), "brier": float("nan"),
+            "log_loss": float("nan"), "sharpness": float("nan"),
+            "entropy": float("nan"), "reliability_gap": float("nan"),
+            "calibration_x": [], "calibration_y": [],
+        }
+
+    # CRPS
+    crps_val = mean_crps(mu_v, sigma_v, y_v)
+
+    # Sharpness & entropy
+    sharp_val = sharpness(sigma_v)
+    entropy_val = prediction_entropy(sigma_v)
+
+    # For Brier / log-loss / calibration we need a binary event.
+    # Use "temperature above the observed median" as the event threshold.
+    threshold = float(np.median(y_v))
+    p_above = 1.0 - norm.cdf((threshold - mu_v) / np.maximum(sigma_v, math.sqrt(SIGMA_MIN_SQ)))
+    outcome_above = (y_v >= threshold).astype(float)
+
+    brier_val = brier_score(p_above, outcome_above)
+    ll_val = log_loss(p_above, outcome_above)
+
+    # Reliability gap: mean absolute difference between predicted probability
+    # and observed frequency (from calibration curve)
+    _, obs_freq, _ = calibration_curve(p_above, outcome_above, n_bins=10)
+    bin_edges = np.linspace(0.0, 1.0, 11)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    valid_bins = np.isfinite(obs_freq)
+    if valid_bins.any():
+        reliability_gap = float(np.mean(np.abs(obs_freq[valid_bins] - bin_centers[valid_bins])))
+    else:
+        reliability_gap = float("nan")
+
+    # Calibration data (for plotting calibration curves / reliability diagrams)
+    calib_x, calib_y, _ = calibration_curve(p_above, outcome_above, n_bins=10)
+    calibration_x = calib_x.tolist() if len(calib_x) > 0 else []
+    calibration_y = calib_y.tolist() if len(calib_y) > 0 else []
+
+    return {
+        "model": model_name,
+        "n": n,
+        "crps": crps_val,
+        "brier": brier_val,
+        "log_loss": ll_val,
+        "sharpness": sharp_val,
+        "entropy": entropy_val,
+        "reliability_gap": reliability_gap,
+        "calibration_x": calibration_x,
+        "calibration_y": calibration_y,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Bracket-level utilities (convert continuous predictions to binary outcomes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -182,189 +319,175 @@ def bracket_outcome(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Aggregate evaluation for a single model cell
+# 8. Model-vs-Market Comparison — bracket-level metrics against Polymarket
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Default Celsius brackets for daily-max temperature
-DEFAULT_BRACKETS = [
-    ("≤0°C", float("-inf"), 1.0),
-    ("1-4°C", 1.0, 5.0),
-    ("5-9°C", 5.0, 10.0),
-    ("10-14°C", 10.0, 15.0),
-    ("15-19°C", 15.0, 20.0),
-    ("20-24°C", 20.0, 25.0),
-    ("25-29°C", 25.0, 30.0),
-    ("30-34°C", 30.0, 35.0),
-    ("≥35°C", 35.0, float("inf")),
-]
 
-# Default Fahrenheit brackets
-DEFAULT_BRACKETS_F = [
-    ("≤32°F", float("-inf"), 33.0),
-    ("33-40°F", 33.0, 41.0),
-    ("41-50°F", 41.0, 51.0),
-    ("51-60°F", 51.0, 61.0),
-    ("61-70°F", 61.0, 71.0),
-    ("71-80°F", 71.0, 81.0),
-    ("81-90°F", 81.0, 91.0),
-    ("91-100°F", 91.0, 101.0),
-    (">100°F", 101.0, float("inf")),
-]
+def model_vs_market_brier(
+    p_model: np.ndarray, p_market: np.ndarray, outcome: np.ndarray,
+) -> float:
+    """Mean Brier score for model predictions vs market-implied probabilities.
+
+    Lower is better. A Brier score of 0 means perfect prediction; the benchmark
+    is the market-implied Brier score (using p_market instead of p_model).
+    """
+    return brier_score(p_model, outcome)
 
 
-def _detect_brackets(T_obs: np.ndarray) -> list[tuple[str, float, float]]:
-    """Detect whether data is Fahrenheit or Celsius and return brackets."""
-    if np.nanmax(T_obs) > 50:
-        return DEFAULT_BRACKETS_F
-    return DEFAULT_BRACKETS
+def calibration_gap(
+    p_model: np.ndarray, p_market: np.ndarray,
+) -> float:
+    """Mean absolute difference between model and market probabilities.
+
+    Measures how much the model disagrees with the market consensus.
+    Lower values mean the model is closer to market pricing.
+    """
+    mask = np.isfinite(p_model) & np.isfinite(p_market)
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(np.abs(p_model[mask] - p_market[mask])))
 
 
-def evaluate_model(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    y: np.ndarray,
-    model_name: str = "",
+def edge_accuracy(
+    p_model: np.ndarray, p_market: np.ndarray,
+    outcome: np.ndarray, threshold: float = 0.05,
 ) -> dict:
-    """Compute all evaluation metrics for a model's predictions.
+    """Evaluate model vs market edge: does the model's high-conviction
+    call (|p_model - 0.5| > threshold) outperform the market?
 
     Parameters
     ----------
-    mu : ndarray  — predicted means
-    sigma : ndarray — predicted standard deviations
-    y : ndarray  — observed values
-    model_name : str — label for the results dict
+    p_model : ndarray — model-implied bracket probabilities
+    p_market : ndarray — market-implied bracket probabilities
+    outcome : ndarray — binary outcomes
+    threshold : float — minimum distance from 0.5 to count as "high conviction"
 
     Returns
     -------
-    dict with keys: crps, brier, log_loss, sharpness, entropy,
-                    calibration_x, calibration_y, reliability_gap, n
+    dict with keys:
+        n_calls          — number of high-conviction calls
+        model_brier      — Brier score on calls using p_model
+        market_brier     — Brier score on calls using p_market
+        edge             — market_brier - model_brier (positive = model adds value)
+        n_correct_model  — count where model predicted >0.5 and outcome=1
+        n_correct_market — count where market predicted >0.5 and outcome=1
     """
-    mask = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(y)
-    mu, sigma, y = mu[mask], sigma[mask], y[mask]
-    n = len(mu)
+    mask = (
+        np.isfinite(p_model) & np.isfinite(p_market)
+        & np.isfinite(outcome) & (np.abs(p_model - 0.5) > threshold)
+    )
+    if not mask.any():
+        return {
+            "n_calls": 0, "model_brier": float("nan"), "market_brier": float("nan"),
+            "edge": float("nan"), "n_correct_model": 0, "n_correct_market": 0,
+        }
 
-    # CRPS (continuous)
-    crps_val = mean_crps(mu, sigma, y)
+    pm = p_model[mask]
+    pk = p_market[mask]
+    oc = outcome[mask]
 
-    # Bracket-level metrics (Brier, log-loss, calibration)
-    brackets = _detect_brackets(y)
-    all_p_yes: list[float] = []
-    all_outcomes: list[float] = []
-
-    for _, low, high in brackets:
-        p_yes = bracket_probability(mu, sigma, low, high)
-        outcome = bracket_outcome(y, low, high)
-        all_p_yes.extend(p_yes.tolist())
-        all_outcomes.extend(outcome.tolist())
-
-    p_yes_arr = np.array(all_p_yes)
-    outcome_arr = np.array(all_outcomes)
-
-    brier_val = brier_score(p_yes_arr, outcome_arr)
-    ll_val = log_loss(p_yes_arr, outcome_arr)
-
-    # Calibration
-    bin_c, obs_f, _ = calibration_curve(p_yes_arr, outcome_arr)
-
-    # Reliability gap (mean absolute gap)
-    gap = np.nanmean(np.abs(obs_f - bin_c)) if len(bin_c) > 0 else float("nan")
-
-    # Sharpness & entropy
-    sharp_val = sharpness(sigma)
-    ent_val = prediction_entropy(sigma)
+    model_brier_val = float(np.mean((pm - oc) ** 2))
+    market_brier_val = float(np.mean((pk - oc) ** 2))
 
     return {
-        "model": model_name,
-        "n": n,
-        "crps": crps_val,
-        "brier": brier_val,
-        "log_loss": ll_val,
-        "sharpness": sharp_val,
-        "entropy": ent_val,
-        "reliability_gap": gap,
-        "calibration_x": bin_c.tolist(),
-        "calibration_y": obs_f.tolist(),
+        "n_calls": int(mask.sum()),
+        "model_brier": model_brier_val,
+        "market_brier": market_brier_val,
+        "edge": market_brier_val - model_brier_val,
+        "n_correct_model": int(((pm > 0.5) & (oc == 1)).sum()),
+        "n_correct_market": int(((pk > 0.5) & (oc == 1)).sum()),
     }
 
 
-def bracket_calibration(
+def compare_model_to_market(
     mu: np.ndarray,
     sigma: np.ndarray,
-    y: np.ndarray,
-    n_bins: int = 10,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calibration curve from Gaussian forecasts via temperature brackets.
+    T_obs: np.ndarray,
+    polymarket_prices: pd.DataFrame,
+    target_dates: np.ndarray,
+    model_name: str = "",
+) -> dict:
+    """Compare model bracket probabilities to market prices and outcomes.
 
-    Converts continuous Gaussian predictions (μ, σ) into bracket-level
-    probability forecasts, then bins these against binary outcomes and returns
-    the calibration curve components.  Suitable for aggregate calibration
-    plotting across multiple data cells.
+    For each (date, bracket) pair, computes:
+      - Model probability P(T in bracket | μ, σ)
+      - Market price P_market
+      - Binary outcome: was T_obs in that bracket?
 
     Parameters
     ----------
-    mu : ndarray  — predicted means
-    sigma : ndarray — predicted standard deviations
-    y : ndarray  — observed values
-    n_bins : int — number of probability bins (default 10)
+    mu : ndarray — predicted means per row
+    sigma : ndarray — predicted stds per row
+    T_obs : ndarray — observed temperatures per row
+    polymarket_prices : pd.DataFrame — from load_polymarket_prices()
+    target_dates : ndarray — date strings/values matching each row
+    model_name : str
 
     Returns
     -------
-    bin_centers : ndarray  — centre of each probability bin
-    observed_freq : ndarray — fraction of positive outcomes per bin
-    counts : ndarray       — number of samples per bin
+    dict with keys: model, n, brier_model, brier_market, calib_gap,
+                    edge_stats, per_bracket DataFrame
     """
-    mask = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(y)
-    mu, sigma, y = mu[mask], sigma[mask], y[mask]
+    # Build lookup: (date_str, low, high) → market_price
+    price_map: dict[tuple[str, float, float], float] = {}
+    for _, row in polymarket_prices.iterrows():
+        d = row["target_date"]
+        ds = str(d.date()) if hasattr(d, "date") else str(d)
+        price_map[(ds, row["low"], row["high"])] = row["price"]
 
-    brackets = _detect_brackets(y)
-    all_p_yes: list[float] = []
-    all_outcomes: list[float] = []
+    rows: list[dict] = []
+    for i in range(len(mu)):
+        if not (np.isfinite(mu[i]) and np.isfinite(sigma[i]) and np.isfinite(T_obs[i])):
+            continue
+        ds = str(pd.Timestamp(target_dates[i]).date())
+        for _, pr in polymarket_prices.iterrows():
+            pr_ds = str(pr["target_date"].date()) if hasattr(pr["target_date"], "date") else str(pr["target_date"])
+            if pr_ds != ds:
+                continue
+            low, high = pr["low"], pr["high"]
+            p_model = bracket_probability(
+                np.array([mu[i]]), np.array([sigma[i]]), low, high
+            )[0]
+            outcome = bracket_outcome(np.array([T_obs[i]]), low, high)[0]
+            market_price = price_map.get((ds, low, high), float("nan"))
+            rows.append({
+                "target_date": ds,
+                "bracket_label": pr["bracket_label"],
+                "low": low,
+                "high": high,
+                "p_model": p_model,
+                "p_market": market_price,
+                "outcome": outcome,
+            })
 
-    for _, low, high in brackets:
-        p_yes = bracket_probability(mu, sigma, low, high)
-        outcome = bracket_outcome(y, low, high)
-        all_p_yes.extend(p_yes.tolist())
-        all_outcomes.extend(outcome.tolist())
+    if not rows:
+        return {"model": model_name, "n": 0, "brier_model": float("nan"),
+                "brier_market": float("nan"), "calib_gap": float("nan"),
+                "edge": {}, "per_bracket": pd.DataFrame()}
 
-    return calibration_curve(
-        np.array(all_p_yes), np.array(all_outcomes), n_bins,
-    )
+    df = pd.DataFrame(rows)
+    valid = df.dropna(subset=["p_model", "p_market", "outcome"])
 
+    if len(valid) < 5:
+        return {"model": model_name, "n": len(valid), "brier_model": float("nan"),
+                "brier_market": float("nan"), "calib_gap": float("nan"),
+                "edge": {}, "per_bracket": df}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6. PIT Histogram — probability integral transform for Gaussian forecasts
-# ═══════════════════════════════════════════════════════════════════════════════
+    p_mod = valid["p_model"].to_numpy()
+    p_mkt = valid["p_market"].to_numpy()
+    outc = valid["outcome"].to_numpy()
 
+    brier_mod = brier_score(p_mod, outc)
+    brier_mkt = brier_score(p_mkt, outc)
+    cal_gap = calibration_gap(p_mod, p_mkt)
+    edge = edge_accuracy(p_mod, p_mkt, outc)
 
-def pit_histogram(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    y: np.ndarray,
-    n_bins: int = 10,
-) -> tuple[np.ndarray, np.ndarray]:
-    """PIT histogram for Gaussian predictive distributions.
-
-    The Probability Integral Transform PIT = Φ((y − μ) / σ) should be
-    uniform under perfect calibration.  Returns bin edges *frequencies*
-    (not densities) for direct plotting.
-
-    Parameters
-    ----------
-    mu : ndarray  — predicted means
-    sigma : ndarray — predicted standard deviations
-    y : ndarray  — observed values
-    n_bins : int — number of histogram bins (default 10)
-
-    Returns
-    -------
-    bin_edges : ndarray  — (n_bins+1,) edges of the histogram bins
-    hist : ndarray       — (n_bins,) frequency in each bin
-    """
-    mask = np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(y)
-    mu, sigma, y = mu[mask], sigma[mask], y[mask]
-
-    sigma = np.maximum(sigma, math.sqrt(SIGMA_MIN_SQ))
-    pit = norm.cdf((y - mu) / sigma)
-
-    hist, bin_edges = np.histogram(pit, bins=n_bins, range=(0.0, 1.0))
-    return bin_edges, hist
+    return {
+        "model": model_name,
+        "n": len(valid),
+        "brier_model": brier_mod,
+        "brier_market": brier_mkt,
+        "calib_gap": cal_gap,
+        "edge": edge,
+        "per_bracket": df,
+    }

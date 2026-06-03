@@ -18,6 +18,7 @@ venv/
 # Data
 data/raw/
 data/*.csv
+polymarket_data/
 output/figures/*
 output/results.csv
 *.pkl
